@@ -1,0 +1,295 @@
+---
+title: "Machine Learning HW 1"
+author: "HW Team 1"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+### Imports and read in data
+
+```{r, include=FALSE}
+# Load packages
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(readr)
+library(mgcv)
+library(pROC)
+library(ROCR)
+library(mice)
+library(earth)
+library(car)
+library(caret)
+```
+
+```{r, include=FALSE}
+# read in training data set
+ins_t <- read_csv("insurance_t.csv")
+```
+
+### Set vars to be continuous or categorical
+```{r, include = FALSE}
+# Numeric variables and vars with > 10 levels are considered continuous
+cont_vars <- c("ACCTAGE", "DDABAL", "DEPAMT", "CHECKS", "NSFAMT", "SAVBAL", 
+               "ATMAMT", "CDBAL", "IRABAL", "INVBAL", "MMBAL", "CCBAL", 
+               "INCOME", "LORES", "HMVAL", "AGE", "CRSCORE", "POSAMT", "DEP", "PHONE", "TELLER", "POS", "MMCRED", "NSF", "CCPURC" )
+
+# Non-binary categorical variables
+disc_vars <- c("BRANCH")
+
+# Binary variables
+binary_vars <- c("DDA", "DIRDEP", "SAV", "ATM", "CD", "IRA", "INV", "MM", "CC", "SDB", "INAREA", "INS")
+
+# Set categorical variables as factor
+ins_t <- ins_t %>%
+  mutate(across(all_of(binary_vars), ~ factor(.)))
+
+ins_t <- ins_t %>%
+  mutate(across(all_of(disc_vars), ~ factor(.)))
+
+# identify columns with any missing values
+na_cols <- names(which(colSums(is.na(ins_t)) > 0))
+
+# create missingness flags to show where values were imputed
+ins_t <- ins_t %>%
+  mutate(across(all_of(na_cols),
+                ~ as.integer(is.na(.)),
+                .names = "{.col}_miss")) %>%
+  mutate(across(ends_with("_miss"), ~ factor(.)))
+
+# set up the imputation methods 
+meth <- make.method(ins_t)
+cont_to_impute <- na_cols[na_cols %in% cont_vars]
+binary_to_impute <- na_cols[na_cols %in% binary_vars]
+disc_to_impute <- na_cols[na_cols %in% disc_vars]
+
+# assing imputation methods based on variable type
+meth[cont_to_impute] <- "pmm"     
+meth[binary_to_impute] <- "logreg" 
+meth[disc_to_impute] <- "polyreg" 
+
+# no imputation needed for flag variables
+meth[!(names(meth) %in% na_cols)] <- ""
+
+# run imputation
+imp <- mice(ins_t,
+            m = 5,            
+            method = meth,
+            maxit = 10,       
+            seed = 123,
+            printFlag = FALSE) 
+
+# final imputed data set
+ins_t_imputed <- complete(imp)
+
+```
+
+
+### VIF check on all vars to identify multicolinearity
+```{r}
+# find all predictors
+all_predictors <- c(cont_vars, disc_vars, binary_vars)
+var_to_drop <- "INS" 
+filtered_predictors <- setdiff(all_predictors, var_to_drop)
+
+# run model to find VIF scores 
+vif_formula_str <- paste0("INS ~ ", paste(filtered_predictors, collapse = " + "))
+vif_model <- glm(as.formula(vif_formula_str),
+                 data = ins_t_imputed, 
+                 family = binomial(link = 'logit'))
+
+# Calculate and print VIF scores
+vif_scores <- vif(vif_model)
+print(vif_scores)
+
+# HMVAL has adjusted vif > 5, rerun without
+var_to_drop <- c("INS", "HMVAL")
+filtered_predictors <- setdiff(all_predictors, var_to_drop)
+vif_formula_str <- paste0("INS ~ ", paste(filtered_predictors, collapse = " + "))
+vif_model <- glm(as.formula(vif_formula_str),
+                 data = ins_t_imputed, 
+                 family = binomial(link = 'logit'))
+vif_scores <- vif(vif_model)
+print(vif_scores)
+# all adjusted vif now less than 5 
+```
+
+### GAM Model
+```{r, include=FALSE}
+
+# identify categorical predictors (including missing flags)
+categorical_vars <- setdiff(c(binary_vars, disc_vars), "INS")
+miss_flag_vars <- names(ins_t_imputed)[endsWith(names(ins_t_imputed), "_miss")]
+categorical_vars <- c(categorical_vars, miss_flag_vars)
+
+# for continuous vars, separate NSF, MMCRED, CCPUR because splines will not be applied there due to number of levels. Remove HMVAL due to multicolineary
+cont_vars <- setdiff(cont_vars, c("NSF", "MMCRED", "CCPURC", "HMVAL"))
+
+# build model formula, fitting splines to continuous variables (aside from three specified above)
+formula_str <- paste0(
+  "INS ~ ",
+  paste(paste0("s(", cont_vars, ", k = 10)"), collapse = " + "),
+  " + NSF + MMCRED + CCPURC + ",
+  paste(categorical_vars, collapse = " + ")
+)
+
+# fit GAM model
+gam.model <- mgcv::gam(
+  as.formula(formula_str),
+  data = ins_t_imputed,           
+  family = binomial(link = 'logit'),
+  method = "REML"
+)
+```
+
+### Model results
+```{r, inlcude = FALSE}
+# find which variables are significant and pull them off
+summary(gam.model)
+anova(gam.model, test = "Chisq")
+sig_continuous <- c("ACCTAGE", "DDABAL", "CHECKS", "SAVBAL", "ATMAMT", "TELLER", "CDBAL", "CCBAL", "PHONE") ## AND NSF (not spline)
+sig_categorical <- c("DDA", "CD", "IRA", "INV", "MM", "CC", "BRANCH")
+```
+
+### Final Model
+```{r, inlcude = FALSE}
+# Build final model with signficant variables
+formula_str_final <- paste0(
+  "INS", " ~ ",
+  paste(paste0("s(", sig_continuous, ")"), collapse = " + "), " + ",
+  paste(sig_categorical, collapse = " + "), " + NSF"
+)
+
+final.gam <- mgcv::gam(as.formula(formula_str_final),
+               data = ins_t_imputed, family = binomial(link = 'logit'), method="REML")
+
+# ROC curve and AUC for final model
+# numeric vectors
+pred_probs_final <- predict(final.gam, type = "response") 
+pred_probs_vec <- as.numeric(pred_probs_final)
+labels_vec <- as.numeric(as.character(ins_t_imputed$INS))
+# prediction and performance
+pred <- prediction(pred_probs_vec, labels_vec)
+perf <- performance(pred, "tpr", "fpr")
+# Plot ROC curve
+plot(perf, col = "black", lwd = 2,
+     xlab = "1 - Specificity", ylab = "Sensitivity", main = "GAM Model ROC Curve")
+# Shade the area under the curve
+x_vals <- perf@x.values[[1]]
+y_vals <- perf@y.values[[1]]
+polygon(c(0, x_vals, 1), c(0, y_vals, 0), col = "lightgray", border = NA)
+abline(a = 0, b = 1, lty = 2, col = "black")  
+# Compute AUC
+auc <- performance(pred, "auc")
+auc_value <- auc@y.values[[1]]
+# Add AUC text to plot
+text(x = 0.6, y = 0.2, labels = paste("AUC =", round(auc_value, 4)), col = "black", cex = 1.2)
+
+
+# Find optimal cutoff using Youden's J statistic
+roc_obj <- roc(ins_t_imputed$INS, pred_probs_final)
+opt_cutoff <- coords(roc_obj, "best", best.method = "youden", transpose = FALSE)
+opt_cutoff
+# This shows the optimal threshold and associated sensitivity/specificity
+
+# Classify predictions using that threshold
+pred_class <- ifelse(pred_probs_final > opt_cutoff$threshold, 1, 0)
+
+# Convert to factors for confusionMatrix
+pred_factor <- factor(pred_class, levels = c(0,1))
+actual_factor <- factor(ins_t_imputed$INS, levels = c(0,1))
+
+# Compute confusion matrix and performance metrics
+cm <- confusionMatrix(pred_factor, actual_factor, positive = "1")
+cm
+
+accuracy  <- cm$overall["Accuracy"]
+precision <- cm$byClass["Precision"]
+recall    <- cm$byClass["Recall"]
+f1_score  <- cm$byClass["F1"]
+
+metrics_gam <- data.frame(
+  Metric = c("Accuracy", "Precision", "Recall", "F1 Score", "AUC", "Optimal Cutoff"),
+  Value = c(round(accuracy, 3), round(precision, 3), round(recall, 3),
+            round(f1_score, 3), round(auc_value, 3), round(opt_cutoff$threshold, 3))
+)
+metrics_gam
+
+```
+
+```{r}
+# build degree one mars model
+mars_model <- earth(
+  INS ~ .,             
+  data = ins_t_imputed,
+  degree = 1,
+  glm = list(family = binomial)  
+)
+summary(mars_model)
+```
+```{r}
+# identify variable importance for MARS model
+ev2 <- evimp(mars_model)
+print(ev2)
+plot(ev2, main="Variable Importance (degree=1, additive)")
+```
+```{r}
+# plot predictors
+par(mfrow=c(2,2))
+plotmo(mars_model, type="response", nresponse=1, do.par=FALSE); par(mfrow=c(1,1))
+```
+
+
+``` {r}
+# values from mars model
+pred_probs_final <- predict(mars_model, type = "response") 
+pred_probs_vec <- as.numeric(pred_probs_final)
+labels_vec <- as.numeric(as.character(ins_t_imputed$INS))
+# prediction and performance
+pred <- prediction(pred_probs_vec, labels_vec)
+perf <- performance(pred, "tpr", "fpr")
+
+# Plot ROC curve
+plot(perf, col = "black", lwd = 2,
+     xlab = "1 - Specificity", ylab = "Sensitivity", main = "MARS Model ROC Curve")
+# Shade the area under the curve
+x_vals <- perf@x.values[[1]]
+y_vals <- perf@y.values[[1]]
+polygon(c(0, x_vals, 1), c(0, y_vals, 0), col = "lightgray", border = NA)
+abline(a = 0, b = 1, lty = 2, col = "black")  
+# Compute AUC
+auc <- performance(pred, "auc")
+auc_value <- auc@y.values[[1]]
+# Add AUC text to plot
+text(x = 0.6, y = 0.2, labels = paste("AUC =", round(auc_value, 4)), col = "black", cex = 1.2)
+
+
+# Find optimal cutoff using Youden's J statistic
+roc_obj <- roc(ins_t_imputed$INS, pred_probs_final)
+opt_cutoff <- coords(roc_obj, "best", best.method = "youden", transpose = FALSE)
+opt_cutoff
+# This shows the optimal threshold and associated sensitivity/specificity
+
+# Classify predictions using that threshold
+pred_class <- ifelse(pred_probs_final > opt_cutoff$threshold, 1, 0)
+
+# Convert to factors for confusionMatrix
+pred_factor <- factor(pred_class, levels = c(0,1))
+actual_factor <- factor(ins_t_imputed$INS, levels = c(0,1))
+
+# Compute confusion matrix and performance metrics
+cm <- confusionMatrix(pred_factor, actual_factor, positive = "1")
+cm
+
+accuracy  <- cm$overall["Accuracy"]
+precision <- cm$byClass["Precision"]
+recall    <- cm$byClass["Recall"]
+f1_score  <- cm$byClass["F1"]
+
+metrics_mars <- data.frame(
+  Metric = c("Accuracy", "Precision", "Recall", "F1 Score", "AUC", "Optimal Cutoff"),
+  Value = c(round(accuracy, 3), round(precision, 3), round(recall, 3),
+            round(f1_score, 3), round(auc_value, 3), round(opt_cutoff$threshold, 3))
+)
+metrics_mars
+```
+
